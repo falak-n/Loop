@@ -4,12 +4,21 @@ const fs = require('fs');
 const path = require('path');
 const csv = require('csv-parser');
 const OpenAI = require('openai');
+const twilio = require('twilio');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
+// Middleware for JSON and URL-encoded (needed for Twilio webhooks)
 app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
 app.use(express.static(path.join(__dirname, 'public')));
+
+// Twilio client
+const twilioClient = twilio(
+  process.env.TWILIO_ACCOUNT_SID,
+  process.env.TWILIO_AUTH_TOKEN
+);
 
 // Load hospitals data from CSV
 const HOSPITAL_CSV_PATH = path.join(__dirname, 'data', 'hospitals.csv');
@@ -66,6 +75,33 @@ const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY || ''
 });
 
+function isOutOfScope(userText) {
+  const lower = userText.toLowerCase();
+  // Keywords that indicate out-of-scope queries
+  const outOfScopeKeywords = [
+    'appointment', 'book', 'schedule', 'insurance coverage', 'claim', 'policy',
+    'stock', 'price', 'weather', 'joke', 'recipe', 'sports', 'news',
+    'movie', 'music', 'restaurant', 'hotel', 'flight', 'travel'
+  ];
+  
+  // Check if query contains out-of-scope keywords and no hospital-related keywords
+  const hospitalKeywords = ['hospital', 'network', 'clinic', 'medical', 'doctor', 'nursing'];
+  const hasHospitalKeyword = hospitalKeywords.some(kw => lower.includes(kw));
+  const hasOutOfScopeKeyword = outOfScopeKeywords.some(kw => lower.includes(kw));
+  
+  // If it has out-of-scope keywords but no hospital keywords, likely out of scope
+  if (hasOutOfScopeKeyword && !hasHospitalKeyword) {
+    return true;
+  }
+  
+  // Very short queries that don't mention hospitals
+  if (userText.trim().split(/\s+/).length < 3 && !hasHospitalKeyword) {
+    return false; // Too short to determine, let OpenAI decide
+  }
+  
+  return false;
+}
+
 function naiveParse(userText) {
   const lower = userText.toLowerCase();
   let intent = 'IN_SCOPE';
@@ -73,32 +109,76 @@ function naiveParse(userText) {
   let hospitalName = '';
   let maxResults = 3;
 
+  // Check for out-of-scope first
+  if (isOutOfScope(userText)) {
+    return {
+      intent: 'OUT_OF_SCOPE',
+      city: '',
+      hospitalName: '',
+      maxResults: 3,
+      outOfScope: true
+    };
+  }
+
   if (lower.includes('around') || lower.includes('near') || lower.includes('nearby')) {
     intent = 'FIND_NEARBY';
   } else if (
     lower.includes('confirm') ||
     lower.includes('in my network') ||
-    lower.includes('is')
+    (lower.includes('is') && lower.includes('network'))
   ) {
     intent = 'CONFIRM_IN_NETWORK';
   }
 
-  // crude "in <city>" capture
-  const inIdx = lower.lastIndexOf(' in ');
-  if (inIdx !== -1) {
-    city = userText.substring(inIdx + 4).replace(/[.?]/g, '').trim();
-  } else if (lower.includes('bangalore')) {
-    city = 'Bangalore';
+  // Extract city - look for "in [city]" pattern
+  const cityPatterns = [
+    /in\s+([a-z\s]+?)(?:\s+is|\s+in\s+my\s+network|$)/i,
+    /in\s+([a-z\s]+?)(?:\s+or\s+not|$)/i,
+    /in\s+([a-z\s]+?)(?:\s+[?.!]|$)/i
+  ];
+  
+  for (const pattern of cityPatterns) {
+    const match = userText.match(pattern);
+    if (match && match[1]) {
+      city = match[1].trim().replace(/[?.!]/g, '');
+      break;
+    }
+  }
+
+  // Fallback: check for common city names
+  if (!city) {
+    const cities = ['bangalore', 'delhi', 'mumbai', 'chennai', 'kolkata', 'hyderabad', 'pune', 'noida', 'gurgaon', 'ghaziabad', 'faridabad'];
+    for (const c of cities) {
+      if (lower.includes(c)) {
+        city = c.charAt(0).toUpperCase() + c.slice(1);
+        break;
+      }
+    }
   }
 
   if (intent === 'CONFIRM_IN_NETWORK') {
-    // take words between 'confirm if'/'confirm whether' and 'in <city>'
-    const match =
-      userText.match(/confirm if (.+?) in/i) ||
-      userText.match(/confirm whether (.+?) in/i) ||
-      userText.match(/if (.+?) in/i);
-    if (match && match[1]) {
-      hospitalName = match[1].trim();
+    // Extract hospital name - look for patterns like:
+    // "confirm [name] in [city]"
+    // "can you confirm [name] in [city]"
+    // "[name] in [city] is in my network"
+    const patterns = [
+      /(?:can\s+you\s+)?confirm\s+(.+?)\s+in\s+/i,
+      /confirm\s+if\s+(.+?)\s+in\s+/i,
+      /confirm\s+whether\s+(.+?)\s+in\s+/i,
+      /if\s+(.+?)\s+in\s+/i,
+      /(.+?)\s+in\s+[a-z\s]+?\s+(?:is\s+)?in\s+my\s+network/i
+    ];
+
+    for (const pattern of patterns) {
+      const match = userText.match(pattern);
+      if (match && match[1]) {
+        hospitalName = match[1].trim();
+        // Remove trailing words that might be part of the query structure
+        hospitalName = hospitalName.replace(/\s+(is|are|was|were|in|the|a|an)\s*$/i, '').trim();
+        if (hospitalName && hospitalName.length > 2) {
+          break;
+        }
+      }
     }
   }
 
@@ -126,9 +206,9 @@ async function extractQueryInfo(userText) {
       'maxResults (integer, default 3). ' +
       'If the question is not about hospitals in the provided network, set intent to "OUT_OF_SCOPE".';
 
-    const result = await openai.responses.create({
-      model: 'gpt-4.1-mini',
-      input: [
+    const result = await openai.chat.completions.create({
+      model: 'gpt-4o-mini',
+      messages: [
         {
           role: 'system',
           content: systemPrompt
@@ -142,10 +222,14 @@ async function extractQueryInfo(userText) {
         type: 'json_schema',
         json_schema: {
           name: 'HospitalQuery',
+          strict: true,
           schema: {
             type: 'object',
             properties: {
-              intent: { type: 'string' },
+              intent: { 
+                type: 'string',
+                enum: ['FIND_NEARBY', 'CONFIRM_IN_NETWORK', 'OUT_OF_SCOPE']
+              },
               city: { type: 'string' },
               hospitalName: { type: 'string' },
               maxResults: { type: 'integer' }
@@ -157,7 +241,7 @@ async function extractQueryInfo(userText) {
       }
     });
 
-    const parsed = result.output[0].content[0].json;
+    const parsed = JSON.parse(result.choices[0].message.content);
     return {
       intent: parsed.intent,
       city: parsed.city,
@@ -171,10 +255,13 @@ async function extractQueryInfo(userText) {
   }
 }
 
-app.post('/api/query', async (req, res) => {
-  const userText = (req.body && req.body.text) || '';
-  if (!userText.trim()) {
-    return res.status(400).json({ error: 'Missing text' });
+// Shared query handler function (used by both web and Twilio)
+async function handleQuery(userText, isFirstMessage = false) {
+  if (!userText || !userText.trim()) {
+    return {
+      reply: 'I am Loop AI, your hospital network assistant. How can I help you today?',
+      endConversation: false
+    };
   }
 
   try {
@@ -191,28 +278,26 @@ app.post('/api/query', async (req, res) => {
     }
 
     if (info.outOfScope || info.intent === 'OUT_OF_SCOPE') {
-      return res.json({
-        reply:
-          "I'm sorry, I can't help with that. I am forwarding this to a human agent.",
+      return {
+        reply: "I'm sorry, I can't help with that. I am forwarding this to a human agent.",
         endConversation: true
-      });
+      };
     }
 
     // Handle search intents
     if (info.intent === 'FIND_NEARBY') {
       if (!info.city) {
-        return res.json({
-          reply:
-            "I can definitely help you find hospitals, but I need to know the city. In which city are you looking for hospitals?",
+        return {
+          reply: "I can definitely help you find hospitals, but I need to know the city. In which city are you looking for hospitals?",
           endConversation: false
-        });
+        };
       }
       const results = searchHospitalsAroundCity(info.city, info.maxResults || 3);
       if (!results.length) {
-        return res.json({
+        return {
           reply: `I could not find any hospitals in our network for ${info.city}.`,
           endConversation: false
-        });
+        };
       }
       const lines = results.map(
         (h, idx) => `${idx + 1}. ${h.name}, ${h.address}, ${h.city}`
@@ -220,49 +305,147 @@ app.post('/api/query', async (req, res) => {
       const reply =
         `Here are ${results.length} hospitals around ${info.city}: ` +
         lines.join(' ');
-      return res.json({ reply, endConversation: false });
+      return { reply, endConversation: false };
     }
 
     if (info.intent === 'CONFIRM_IN_NETWORK') {
       if (!info.hospitalName) {
-        return res.json({
-          reply:
-            'I found several similar names. Can you please repeat the full hospital name and city?',
+        return {
+          reply: 'I found several similar names. Can you please repeat the full hospital name and city?',
           endConversation: false
-        });
+        };
       }
       if (!info.city) {
-        return res.json({
-          reply:
-            'I have found hospitals with this name in multiple locations. In which city are you looking for this hospital?',
+        return {
+          reply: 'I have found hospitals with this name in multiple locations. In which city are you looking for this hospital?',
           endConversation: false
-        });
+        };
       }
       const matches = findHospitalInCityByName(info.hospitalName, info.city);
       if (matches.length > 0) {
-        return res.json({
+        return {
           reply: `Yes, ${info.hospitalName} in ${info.city} is in your Loop network.`,
           endConversation: false
-        });
+        };
       }
-      return res.json({
+      return {
         reply: `I could not find ${info.hospitalName} in ${info.city} in your Loop network.`,
         endConversation: false
-      });
+      };
     }
 
     // Fallback: treat as in-scope but unclear
-    return res.json({
-      reply:
-        'I am Loop AI, your hospital network assistant. You can ask me to find hospitals in a city or confirm if a specific hospital in a city is in your network.',
+    const intro = isFirstMessage 
+      ? 'Hi, I am Loop AI, your hospital network assistant. '
+      : '';
+    return {
+      reply: intro + 'I can help you find hospitals in a city or confirm if a specific hospital in a city is in your network.',
       endConversation: false
-    });
+    };
   } catch (err) {
-    console.error('Error handling /api/query:', err);
-    return res.status(500).json({
-      error: 'Internal server error'
-    });
+    console.error('Error handling query:', err);
+    return {
+      reply: 'Sorry, something went wrong while processing your request.',
+      endConversation: false
+    };
   }
+}
+
+// Web API endpoint (existing)
+app.post('/api/query', async (req, res) => {
+  const userText = (req.body && req.body.text) || '';
+  if (!userText.trim()) {
+    return res.status(400).json({ error: 'Missing text' });
+  }
+
+  const result = await handleQuery(userText, !req.body.introduced);
+  return res.json(result);
+});
+
+// Twilio Voice Webhook - Initial call handler
+app.post('/twilio/voice', (req, res) => {
+  const twiml = new twilio.twiml.VoiceResponse();
+  
+  // Introduction
+  twiml.say(
+    'Hi, I am Loop AI, your hospital network assistant. I can help you find hospitals in a city or confirm if a specific hospital is in your network.',
+    { voice: 'alice', language: 'en-IN' }
+  );
+  
+  // Gather speech input
+  const gather = twiml.gather({
+    input: 'speech',
+    language: 'en-IN',
+    speechTimeout: 'auto',
+    action: '/twilio/voice/response',
+    method: 'POST',
+    numDigits: 0
+  });
+  
+  gather.say('Please ask your question.', { voice: 'alice', language: 'en-IN' });
+  
+  // Fallback if no input
+  twiml.say('I did not receive your question. Please call again.', { voice: 'alice', language: 'en-IN' });
+  twiml.hangup();
+  
+  res.type('text/xml');
+  res.send(twiml.toString());
+});
+
+// Twilio Voice Webhook - Handle user response
+app.post('/twilio/voice/response', async (req, res) => {
+  const twiml = new twilio.twiml.VoiceResponse();
+  const userSpeech = req.body.SpeechResult || '';
+  const callSid = req.body.CallSid;
+  
+  // Store conversation state (simple in-memory for demo, use Redis/DB in production)
+  if (!global.twilioSessions) {
+    global.twilioSessions = {};
+  }
+  const isFirstMessage = !global.twilioSessions[callSid];
+  global.twilioSessions[callSid] = true;
+  
+  if (!userSpeech || !userSpeech.trim()) {
+    twiml.say('I did not understand. Please ask your question again.', { voice: 'alice', language: 'en-IN' });
+    const gather = twiml.gather({
+      input: 'speech',
+      language: 'en-IN',
+      speechTimeout: 'auto',
+      action: '/twilio/voice/response',
+      method: 'POST'
+    });
+    twiml.hangup();
+    res.type('text/xml');
+    return res.send(twiml.toString());
+  }
+  
+  // Process the query
+  const result = await handleQuery(userSpeech, isFirstMessage);
+  
+  // Speak the response
+  twiml.say(result.reply, { voice: 'alice', language: 'en-IN' });
+  
+  // If conversation should end (out of scope), hang up
+  if (result.endConversation) {
+    twiml.hangup();
+  } else {
+    // Continue conversation - gather next input
+    const gather = twiml.gather({
+      input: 'speech',
+      language: 'en-IN',
+      speechTimeout: 'auto',
+      action: '/twilio/voice/response',
+      method: 'POST'
+    });
+    gather.say('You can ask another question, or say goodbye to end the call.', { voice: 'alice', language: 'en-IN' });
+    
+    // Timeout fallback
+    twiml.say('Thank you for calling Loop AI. Goodbye.', { voice: 'alice', language: 'en-IN' });
+    twiml.hangup();
+  }
+  
+  res.type('text/xml');
+  res.send(twiml.toString());
 });
 
 // Simple health check
