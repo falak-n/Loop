@@ -4,7 +4,6 @@ const fs = require('fs');
 const path = require('path');
 const csv = require('csv-parser');
 const OpenAI = require('openai');
-const twilio = require('twilio');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -14,11 +13,23 @@ app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 app.use(express.static(path.join(__dirname, 'public')));
 
-// Twilio client
-const twilioClient = twilio(
-  process.env.TWILIO_ACCOUNT_SID,
-  process.env.TWILIO_AUTH_TOKEN
-);
+// Twilio client (optional - only if credentials are provided)
+let twilio = null;
+let twilioClient = null;
+if (process.env.TWILIO_ACCOUNT_SID && process.env.TWILIO_AUTH_TOKEN) {
+  try {
+    twilio = require('twilio');
+    twilioClient = twilio(
+      process.env.TWILIO_ACCOUNT_SID,
+      process.env.TWILIO_AUTH_TOKEN
+    );
+    console.log('Twilio integration enabled');
+  } catch (err) {
+    console.warn('Twilio module not available, phone integration disabled');
+  }
+} else {
+  console.log('Twilio credentials not configured, phone integration disabled');
+}
 
 // Load hospitals data from CSV
 const HOSPITAL_CSV_PATH = path.join(__dirname, 'data', 'hospitals.csv');
@@ -364,6 +375,9 @@ app.post('/api/query', async (req, res) => {
 
 // Twilio Voice Webhook - Initial call handler
 app.post('/twilio/voice', (req, res) => {
+  if (!twilio) {
+    return res.status(503).send('Twilio integration not configured');
+  }
   const twiml = new twilio.twiml.VoiceResponse();
   
   // Introduction
@@ -394,6 +408,9 @@ app.post('/twilio/voice', (req, res) => {
 
 // Twilio Voice Webhook - Handle user response
 app.post('/twilio/voice/response', async (req, res) => {
+  if (!twilio) {
+    return res.status(503).send('Twilio integration not configured');
+  }
   const twiml = new twilio.twiml.VoiceResponse();
   const userSpeech = req.body.SpeechResult || '';
   const callSid = req.body.CallSid;
